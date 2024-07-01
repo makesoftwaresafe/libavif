@@ -192,6 +192,10 @@ typedef enum AVIF_NODISCARD avifResult
     AVIF_RESULT_DECODE_GAIN_MAP_FAILED = 31,
     AVIF_RESULT_INVALID_TONE_MAPPED_IMAGE = 32,
 #endif
+#if defined(AVIF_ENABLE_EXPERIMENTAL_SAMPLE_TRANSFORM)
+    AVIF_RESULT_ENCODE_SAMPLE_TRANSFORM_FAILED = 33,
+    AVIF_RESULT_DECODE_SAMPLE_TRANSFORM_FAILED = 34,
+#endif
 
     // Kept for backward compatibility; please use the symbols above instead.
     AVIF_RESULT_NO_AV1_ITEMS_FOUND = AVIF_RESULT_MISSING_IMAGE_ITEM
@@ -206,8 +210,8 @@ typedef enum avifHeaderFormat
 {
     // AVIF file with an "avif" brand, a MetaBox and all its required boxes for maximum compatibility.
     AVIF_HEADER_FULL,
-#if defined(AVIF_ENABLE_EXPERIMENTAL_AVIR)
-    // AVIF file with an "avir" brand and a CondensedImageBox to reduce the encoded file size.
+#if defined(AVIF_ENABLE_EXPERIMENTAL_MINI)
+    // AVIF file with an "mif3" brand and a MinimizedImageBox to reduce the encoded file size.
     // This is based on the m64572 "Condensed image item" MPEG proposal for HEIF.
     // WARNING: Experimental feature. Produces files that are incompatible with older decoders.
     AVIF_HEADER_REDUCED,
@@ -293,7 +297,8 @@ typedef enum avifChromaSamplePosition
 {
     AVIF_CHROMA_SAMPLE_POSITION_UNKNOWN = 0,
     AVIF_CHROMA_SAMPLE_POSITION_VERTICAL = 1,
-    AVIF_CHROMA_SAMPLE_POSITION_COLOCATED = 2
+    AVIF_CHROMA_SAMPLE_POSITION_COLOCATED = 2,
+    AVIF_CHROMA_SAMPLE_POSITION_RESERVED = 3
 } avifChromaSamplePosition;
 
 // ---------------------------------------------------------------------------
@@ -301,8 +306,13 @@ typedef enum avifChromaSamplePosition
 
 typedef enum avifRange
 {
-    AVIF_RANGE_LIMITED = 0,
-    AVIF_RANGE_FULL = 1
+    // avifRange is only applicable to YUV planes. RGB and alpha planes are always full range.
+    AVIF_RANGE_LIMITED = 0, /**<- Y  [16..235],  UV  [16..240]  (bit depth 8) */
+                            /**<- Y  [64..940],  UV  [64..960]  (bit depth 10) */
+                            /**<- Y [256..3760], UV [256..3840] (bit depth 12) */
+    AVIF_RANGE_FULL = 1     /**<- [0..255]  (bit depth 8) */
+                            /**<- [0..1023] (bit depth 10) */
+                            /**<- [0..4095] (bit depth 12) */
 } avifRange;
 
 // ---------------------------------------------------------------------------
@@ -553,7 +563,7 @@ typedef struct avifContentLightLevelInformationBox
 // Gain Maps are a HIGHLY EXPERIMENTAL FEATURE. The format might still change and
 // images containing a gain map encoded with the current version of libavif might
 // not decode with a future version of libavif. The API is not guaranteed
-// to be stable, and might even be removed in the future. Use are your own risk.
+// to be stable, and might even be removed in the future. Use at your own risk.
 // This is based on ISO/IEC JTC 1/SC 29/WG 3 m64379
 // This product includes Gain Map technology under license by Adobe.
 //
@@ -620,16 +630,13 @@ typedef struct avifGainMapMetadata
     //
     // If 'H' is the display's current log2-encoded HDR capacity (HDR to SDR ratio),
     // then the weight 'w' to apply the gain map is computed as follows:
-    // f = clamp((H - hdrCapacityMin) /
-    //           (hdrCapacityMax - hdrCapacityMin), 0, 1);
-    // w = backwardDirection ? f * -1 : f;
+    // f = clamp((H - baseHdrHeadroom) /
+    //           (alternateHdrHeadroom - baseHdrHeadroom), 0, 1);
+    // w = sign(alternateHdrHeadroom - baseHdrHeadroom) * f
     uint32_t baseHdrHeadroomN;
     uint32_t baseHdrHeadroomD;
     uint32_t alternateHdrHeadroomN;
     uint32_t alternateHdrHeadroomD;
-
-    // True if the gain map should be applied in reverse, see weight formula above.
-    avifBool backwardDirection;
 
     // True if tone mapping should be performed in the color space of the
     // base image. If false, the color space of the alternate image should
@@ -692,7 +699,6 @@ typedef struct avifGainMapMetadataDouble
     double alternateOffset[3];
     double baseHdrHeadroom;
     double alternateHdrHeadroom;
-    avifBool backwardDirection;
     avifBool useBaseColorSpace;
 } avifGainMapMetadataDouble;
 
@@ -705,6 +711,38 @@ AVIF_NODISCARD AVIF_API avifBool avifGainMapMetadataDoubleToFractions(avifGainMa
 AVIF_NODISCARD AVIF_API avifBool avifGainMapMetadataFractionsToDouble(avifGainMapMetadataDouble * dst, const avifGainMapMetadata * src);
 
 #endif // AVIF_ENABLE_EXPERIMENTAL_GAIN_MAP
+
+// ---------------------------------------------------------------------------
+
+#if defined(AVIF_ENABLE_EXPERIMENTAL_SAMPLE_TRANSFORM)
+// Sample Transforms are a HIGHLY EXPERIMENTAL FEATURE. The format might still
+// change and images containing a sample transform item encoded with the current
+// version of libavif might not decode with a future version of libavif.
+// Use at your own risk.
+// This is based on a proposal from the Alliance for Open Media.
+
+typedef enum avifSampleTransformRecipe
+{
+    AVIF_SAMPLE_TRANSFORM_NONE,
+    // Encode the 8 most significant bits of each input image sample losslessly
+    // into a base image. The remaining 8 least significant bits are encoded in
+    // a separate hidden image item. The two are combined at decoding into one
+    // image with the same bit depth as the original image. It is backward
+    // compatible in the sense that it is possible to decode only the base image
+    // (ignoring the hidden image item), leading to a valid image but with
+    // precision loss (16-bit samples truncated to the 8 most significant bits).
+    AVIF_SAMPLE_TRANSFORM_BIT_DEPTH_EXTENSION_8B_8B,
+    // Encode the 12 most significant bits of each input image sample losslessly
+    // into a base image. The remaining 4 least significant bits are encoded in
+    // a separate hidden image item. The two are combined at decoding into one
+    // image with the same bit depth as the original image. It is backward
+    // compatible in the sense that it is possible to decode only the base image
+    // (ignoring the hidden image item), leading to a valid image but with
+    // precision loss (16-bit samples truncated to the 12 most significant
+    // bits).
+    AVIF_SAMPLE_TRANSFORM_BIT_DEPTH_EXTENSION_12B_4B
+} avifSampleTransformRecipe;
+#endif // AVIF_ENABLE_EXPERIMENTAL_SAMPLE_TRANSFORM
 
 // ---------------------------------------------------------------------------
 // avifImage
@@ -757,6 +795,7 @@ typedef struct avifImage
     //
     // To encode any of these boxes, set the values in the associated box, then enable the flag in
     // transformFlags. On decode, only honor the values in boxes with the associated transform flag set.
+    // These also apply to gainMap->image, if any.
     avifTransformFlags transformFlags;
     avifPixelAspectRatioBox pasp;
     avifCleanApertureBox clap;
@@ -774,6 +813,7 @@ typedef struct avifImage
 #if defined(AVIF_ENABLE_EXPERIMENTAL_GAIN_MAP)
     // Gain map image and metadata. NULL if no gain map is present.
     // Owned by the avifImage and gets freed when calling avifImageDestroy().
+    // gainMap->image->transformFlags is always AVIF_TRANSFORM_NONE.
     avifGainMap * gainMap;
 #endif
 } avifImage;
@@ -1457,6 +1497,11 @@ typedef struct avifEncoder
 
 #if defined(AVIF_ENABLE_EXPERIMENTAL_GAIN_MAP)
     int qualityGainMap; // changeable encoder setting
+#endif
+
+#if defined(AVIF_ENABLE_EXPERIMENTAL_SAMPLE_TRANSFORM)
+    // Perform extra steps at encoding and decoding to extend AV1 features using bundled additional image items.
+    avifSampleTransformRecipe sampleTransformRecipe;
 #endif
 } avifEncoder;
 
